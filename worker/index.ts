@@ -15,6 +15,7 @@ import { migrate, setSqliteBackend } from "../src/db";
 import { setFormulaStore } from "../src/levels";
 import { backfillStats, dailyCleanup } from "../src/stats";
 import { timingSafeEqual } from "../src/utils";
+import { isValidIp, setIpResolver } from "../src/rate-limit";
 import { doSqlite } from "./do-sqlite";
 import { formulaDbStore } from "./levels-env-db";
 
@@ -29,11 +30,35 @@ const CRON_PREFIX = "/internal/cron/";
 
 export class App {
   private initialized = false;
+  private ipResolverReady = false;
 
   constructor(
     private ctx: DurableObjectState,
     private env: Env,
   ) {}
+
+  /**
+   * 反代透传的真实客户端 IP（Pages 反代场景）。
+   *
+   * pages.dev → workers.dev 是「跨 zone 子请求」，Cloudflare 会把 CF-Connecting-IP
+   * 强制改写成 2a06:98c0:3600::103，服务端因此会把所有访客算成同一个 IP。
+   * 这里在 PROXY_SECRET 已配置、且请求携带的 x-proxy-secret 与之匹配时，
+   * 改用反代透传的 x-real-client-ip；否则一律回退到 CF-Connecting-IP（原行为不变）。
+   * 直接访问 workers.dev 的请求无法伪造 x-proxy-secret，故不会被冒充。
+   */
+  private setupIpResolver(): void {
+    if (this.ipResolverReady) return;
+    this.ipResolverReady = true;
+    setIpResolver((c) => {
+      const secret = (this.env.PROXY_SECRET ?? "").trim();
+      if (secret === "") return null;
+      const given = (c.req.header("x-proxy-secret") ?? "").trim();
+      if (given === "" || !timingSafeEqual(given, secret)) return null;
+      const ip = (c.req.header("x-real-client-ip") ?? "").trim();
+      if (!isValidIp(ip)) return null;
+      return ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+    });
+  }
 
   /** 惰性初始化：首次请求前完成（同步段执行，不受后续 await 交错影响） */
   private init(): void {
@@ -47,6 +72,7 @@ export class App {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     if (url.pathname.startsWith(CRON_PREFIX)) return this.handleCron(req, url);
+    this.setupIpResolver();
     this.init();
     /* DO 的 ctx 缺 passThroughOnException，Hono 的 ExecutionContext 形状由适配对象补齐；
      * 本项目不使用 c.executionCtx，waitUntil 也无调用方，转发即可 */
